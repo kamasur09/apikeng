@@ -3,24 +3,30 @@
 
 import os
 import re
+import gc
 import json
 import time
 import uuid
 import random
 import hashlib
 import inspect
+import traceback
+import faulthandler
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
 import psutil
+import requests
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from instagrapi import Client
 from instagrapi.exceptions import BadPassword, ClientNeedsUpgradeError, TwoFactorRequired
 from pydantic import BaseModel
+
+faulthandler.enable()
 
 try:
     from igrapiweb import make_ig_web_socket
@@ -46,11 +52,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 TEMPLATE_FILE = os.path.join(DATA_DIR, "template.json")
 WS_SESSIONS_FILE = os.path.join(DATA_DIR, "ws_sessions.json")
+TASKS_STATE_FILE = os.path.join(DATA_DIR, "tasks_state.json")
 
 DEFAULT_SINGLE_LINE_TEMPLATE = "<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌒-"
 DEFAULT_GROUP_TITLE_TEMPLATE = "{TARGET}"
-# 11 lines matching the exact line count and blank-line gaps of the original BASE_TEMPLATE:
-# 5 blank lines after lines 1, 2, 3; 6 blank lines after lines 4..10; no trailing blank lines after line 11.
 LINE_GAPS_AFTER = [6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 1]
 
 EMOJI_POOL = [
@@ -102,6 +107,7 @@ if IGRAPIWEB_AVAILABLE and make_ig_web_socket is not None:
 MAX_RETRIES = 5
 
 active_tasks: dict = {}
+multi_gc_jobs: dict = {}
 group_creator_jobs: dict = {}
 ws_sessions: dict = {}
 client_cache: dict = {}
@@ -112,10 +118,15 @@ store_lock = threading.Lock()
 GLOBAL_MESSAGES_SENT = 0
 BOT_START_TIME = datetime.now()
 
+try:
+    psutil.cpu_percent(interval=None)
+except Exception:
+    pass
+
 app = FastAPI(title="IG Web Controller")
 
 
-# ======================== AUTH HELPER ========================
+# ======================== AUTH & ATOMIC IO HELPERS ========================
 
 def verify_auth(x_panel_token: Optional[str] = None, token_query: Optional[str] = None):
     if not PANEL_TOKEN:
@@ -125,32 +136,37 @@ def verify_auth(x_panel_token: Optional[str] = None, token_query: Optional[str] 
         raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing panel token")
 
 
+def atomic_write_json(path: str, payload: dict):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def _read_json_dict(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 # ======================== PERSISTENCE ========================
 
 def load_saved_accounts() -> dict:
     with store_lock:
-        if not os.path.exists(ACCOUNTS_FILE):
-            return {}
-        try:
-            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+        return _read_json_dict(ACCOUNTS_FILE)
 
 
 def register_saved_account(username: str, ig_user_id=None, auth_method: str = "password"):
     with store_lock:
-        accounts = {}
-        if os.path.exists(ACCOUNTS_FILE):
-            try:
-                with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                    if isinstance(loaded, dict):
-                        accounts = loaded
-            except Exception:
-                accounts = {}
-
+        accounts = _read_json_dict(ACCOUNTS_FILE)
         prev = accounts.get(username, {})
         accounts[username] = {
             "username": username,
@@ -158,22 +174,15 @@ def register_saved_account(username: str, ig_user_id=None, auth_method: str = "p
             "auth_method": auth_method,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
-        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(accounts, f, indent=2)
+        atomic_write_json(ACCOUNTS_FILE, accounts)
 
 
 def delete_saved_account(username: str):
     with store_lock:
-        if os.path.exists(ACCOUNTS_FILE):
-            try:
-                with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-                    accounts = json.load(f)
-                if isinstance(accounts, dict) and username in accounts:
-                    del accounts[username]
-                    with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
-                        json.dump(accounts, f, indent=2)
-            except Exception:
-                pass
+        accounts = _read_json_dict(ACCOUNTS_FILE)
+        if username in accounts:
+            del accounts[username]
+            atomic_write_json(ACCOUNTS_FILE, accounts)
         session_path = os.path.join(DATA_DIR, f"ig_{username}.json")
         if os.path.exists(session_path):
             try:
@@ -184,15 +193,7 @@ def delete_saved_account(username: str):
 
 
 def _read_template_payload() -> dict:
-    if os.path.exists(TEMPLATE_FILE):
-        try:
-            with open(TEMPLATE_FILE, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            if isinstance(payload, dict):
-                return payload
-        except Exception:
-            pass
-    return {}
+    return _read_json_dict(TEMPLATE_FILE)
 
 
 def get_active_single_line_template() -> str:
@@ -227,16 +228,14 @@ def set_active_template(tpl: str, group_title_template: Optional[str] = None):
             if isinstance(group_title_template, str) and group_title_template.strip()
             else existing.get("group_title_template") or DEFAULT_GROUP_TITLE_TEMPLATE
         )
-        with open(TEMPLATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "template": single_line,
-                    "group_title_template": gt,
-                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                },
-                f,
-                indent=2,
-            )
+        atomic_write_json(
+            TEMPLATE_FILE,
+            {
+                "template": single_line,
+                "group_title_template": gt,
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        )
 
 
 def reset_active_template():
@@ -249,26 +248,73 @@ def reset_active_template():
 
 
 def save_ws_sessions_disk():
+    with ws_lock:
+        payload = {uid: dict(w.data) for uid, w in ws_sessions.items()}
     with store_lock:
-        with ws_lock:
-            payload = {uid: w.data for uid, w in ws_sessions.items()}
         try:
-            with open(WS_SESSIONS_FILE, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
+            atomic_write_json(WS_SESSIONS_FILE, payload)
         except Exception as exc:
             print(f"[WS] Disk save error: {exc}", flush=True)
 
 
 def load_ws_sessions_disk() -> dict:
     with store_lock:
-        if not os.path.exists(WS_SESSIONS_FILE):
-            return {}
+        return _read_json_dict(WS_SESSIONS_FILE)
+
+
+def save_tasks_state_disk():
+    with tasks_lock:
+        payload = {"tasks": [], "multi_gc": []}
+
+        for tid, info in active_tasks.items():
+            payload["tasks"].append({
+                "task_id": tid,
+                "username": info.get("username"),
+                "raw_username": info.get("raw_username"),
+                "ws_uid": info.get("ws_uid"),
+                "session_id": info.get("session_id"),
+                "ua": info.get("ua"),
+                "thread_ids": list(info.get("thread_ids", [])),
+                "target_name": info.get("target_name", ""),
+                "speed_mode": info.get("speed_mode", "slow"),
+                "use_nc": bool(info.get("use_nc", True)),
+                "running": bool(info.get("running", False)),
+                "msg_count": int(info.get("msg_count", 0)),
+            })
+
+        for jid, job in multi_gc_jobs.items():
+            payload["multi_gc"].append({
+                "job_id": jid,
+                "username": job.get("username"),
+                "ws_uid": job.get("ws_uid"),
+                "session_id": job.get("session_id"),
+                "ua": job.get("ua"),
+                "label": job.get("label", ""),
+                "thread_ids": list(job.get("thread_ids", [])),
+                "target_name": job.get("target_name", ""),
+                "custom_text": job.get("custom_text", ""),
+                "nc_text": job.get("nc_text", ""),
+                "speed_mode": job.get("speed_mode", "slow"),
+                "use_nc": bool(job.get("use_nc", True)),
+                "running": bool(job.get("running", False)),
+                "msg_count": int(job.get("msg_count", 0)),
+                "rename_count": int(job.get("rename_count", 0)),
+            })
+
+    with store_lock:
         try:
-            with open(WS_SESSIONS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+            atomic_write_json(TASKS_STATE_FILE, payload)
+        except Exception as exc:
+            print(f"[TASKS] Disk save error: {exc}", flush=True)
+
+
+def load_tasks_state_disk() -> dict:
+    with store_lock:
+        data = _read_json_dict(TASKS_STATE_FILE)
+        return {
+            "tasks": data.get("tasks") if isinstance(data.get("tasks"), list) else [],
+            "multi_gc": data.get("multi_gc") if isinstance(data.get("multi_gc"), list) else [],
+        }
 
 
 def render_single_line_with_random_emoji(base_line: str, target_name: str) -> str:
@@ -301,6 +347,10 @@ def make_subtle_z_link() -> str:
 def make_ig_client() -> Client:
     cl = Client()
     cl.delay_range = [0, 0]
+    try:
+        cl.request_timeout = 15
+    except Exception:
+        pass
     try:
         if IG_APP_VERSION:
             cl.set_app_version(IG_APP_VERSION)
@@ -363,7 +413,7 @@ def get_or_resume_client(username: str) -> Client:
 
 
 def list_threads(client: Client):
-    threads = client.direct_threads(amount=25)
+    threads = client.direct_threads(amount=30)
     out = []
     for t in threads:
         tid_str = str(t.id).strip()
@@ -379,9 +429,99 @@ def list_threads(client: Client):
         out.append({
             "id": tid_str,
             "is_group": is_group,
+            "title": title,
             "label": f"[{tag}] {title[:32]}",
         })
     return out
+
+
+def _extract_threads_from_web_json(obj, acc: list, seen: set):
+    if isinstance(obj, dict):
+        tid = obj.get("thread_id") or obj.get("id")
+        if tid and str(tid).strip().isdigit():
+            s_tid = str(tid).strip()
+            has_thread_shape = any(
+                k in obj for k in ("thread_title", "users", "items", "last_permanent_item", "is_group")
+            )
+            if has_thread_shape and s_tid not in seen:
+                seen.add(s_tid)
+                is_group = bool(obj.get("is_group", False))
+                title = str(obj.get("thread_title") or "").strip()
+                if not title and isinstance(obj.get("users"), list):
+                    names = [
+                        str(u.get("username") or u.get("full_name") or "").strip()
+                        for u in obj["users"]
+                        if isinstance(u, dict) and (u.get("username") or u.get("full_name"))
+                    ]
+                    title = ", ".join(names) if names else ("Group Chat" if is_group else "Direct Chat")
+                if not title:
+                    title = "Group Chat" if is_group else "Direct Chat"
+                tag = "GC" if is_group else "DM"
+                acc.append({
+                    "id": s_tid,
+                    "is_group": is_group,
+                    "title": title,
+                    "label": f"[{tag}] {title[:32]}",
+                })
+        for v in obj.values():
+            _extract_threads_from_web_json(v, acc, seen)
+    elif isinstance(obj, list):
+        for item in obj:
+            _extract_threads_from_web_json(item, acc, seen)
+
+
+def fetch_threads_via_sessionid(session_id: str, ua: Optional[str] = None) -> list[dict]:
+    sid = clean_session_id(session_id)
+    if not sid:
+        raise RuntimeError("Missing session ID.")
+
+    headers = {
+        "User-Agent": ua or random.choice(WS_UA_POOL),
+        "X-IG-App-ID": "936619743392459",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.instagram.com/direct/inbox/",
+    }
+    cookies = {"sessionid": sid}
+
+    if IGRAPIWEB_AVAILABLE and make_ig_web_socket is not None:
+        sock = None
+        try:
+            sock = make_ig_web_socket(sessionid=sid, user_agent=headers["User-Agent"])
+            for method_name in ("get_inbox", "direct_threads", "fetch_threads", "list_threads"):
+                fn = getattr(sock, method_name, None)
+                if callable(fn):
+                    res = fn()
+                    found = []
+                    _extract_threads_from_web_json(res, found, set())
+                    if found:
+                        return found[:30]
+        except Exception:
+            pass
+        finally:
+            if sock is not None:
+                try:
+                    sock.disconnect()
+                except Exception:
+                    pass
+
+    last_err = None
+    for url in (
+        "https://www.instagram.com/api/v1/direct_v2/inbox/?persistentBadging=true&folder=&limit=30",
+        "https://i.instagram.com/api/v1/direct_v2/inbox/?persistentBadging=true&folder=&limit=30",
+    ):
+        try:
+            resp = requests.get(url, headers=headers, cookies=cookies, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                found = []
+                _extract_threads_from_web_json(data, found, set())
+                if found:
+                    return found[:30]
+            last_err = f"HTTP {resp.status_code}"
+        except Exception as exc:
+            last_err = str(exc)[:100]
+
+    raise RuntimeError(f"Could not fetch chats from session ID ({last_err or 'empty inbox'}).")
 
 
 def parse_thread_ids(raw_ids) -> list[str]:
@@ -814,8 +954,7 @@ class WsSessionWorker:
         return True, None
 
     def _msg_loop(self):
-        global GLOBAL_MESSAGES_SENT
-        self._executor = ThreadPoolExecutor(max_workers=16)
+        self._executor = ThreadPoolExecutor(max_workers=8)
         next_fire = time.monotonic()
 
         try:
@@ -826,10 +965,10 @@ class WsSessionWorker:
 
                 with self._pool_lock:
                     live = sum(1 for s in self.sockets if s is not None)
-                max_inflight = max(2, live * 4) if live > 0 else 1
+                max_inflight = max(2, live * 3) if live > 0 else 1
 
                 now = time.monotonic()
-                max_debt = max(1.5, interval * 20)
+                max_debt = max(1.5, interval * 10)
                 if next_fire < now - max_debt:
                     next_fire = now
 
@@ -1028,7 +1167,6 @@ class WsSessionWorker:
                     self.stats["session_error"] = str(exc)[:100]
 
     def _rename_loop(self):
-        """One-by-one group rename loop with spacing between threads and no instant multi-thread burst."""
         while not self.stop_event.is_set():
             r_min = max(1.0, float(self.data.get("rename_min", 5)))
             r_max = max(r_min, float(self.data.get("rename_max", 15)))
@@ -1138,82 +1276,86 @@ def log_creator(job_id: str, msg: str, created_id: Optional[str] = None, err: Op
 
 
 def group_creator_loop(job_id: str):
-    with tasks_lock:
-        job = group_creator_jobs.get(job_id)
-        if not job:
-            return
-        cl: Client = job["client"]
-        count = int(job["count"])
-        title_tpl = str(job["title_template"])
-        target_name = str(job["target_name"])
-        usernames = list(job["usernames"])
-        send_ping = bool(job["send_ping"])
-        min_cd = float(job["min_cooldown"])
-        max_cd = float(job["max_cooldown"])
-
-    log_creator(job_id, f"Resolving {len(usernames)} username(s)...")
-    resolved_ids, failed_users = resolve_usernames_to_ids(cl, usernames)
-    if failed_users:
-        log_creator(job_id, f"Unresolved: {', '.join(failed_users)}", err="; ".join(failed_users))
-
-    if len(resolved_ids) < 2:
-        set_creator_running(job_id, False)
-        log_creator(
-            job_id,
-            f"Need >=2 valid usernames (resolved {len(resolved_ids)})",
-            err=f"Only resolved {len(resolved_ids)} user IDs from {usernames}",
-        )
-        return
-
-    log_creator(job_id, f"Resolved {len(resolved_ids)} users; creating {count} group(s)")
-
-    for idx in range(1, count + 1):
-        if not is_creator_running(job_id):
-            log_creator(job_id, "Stopped by user")
-            return
-
-        rendered_title = title_tpl.replace("{TARGET}", target_name).replace("{N}", str(idx)).strip()
-        if not rendered_title:
-            rendered_title = f"Group {idx}"
-
-        made = False
-        for attempt in range(1, MAX_RETRIES + 1):
-            if not is_creator_running(job_id):
+    try:
+        with tasks_lock:
+            job = group_creator_jobs.get(job_id)
+            if not job:
                 return
-            try:
-                tid_str = _create_single_group(cl, rendered_title, resolved_ids, send_ping)
-                log_creator(job_id, f"Created {idx}/{count} -> {tid_str}", created_id=tid_str)
-                made = True
-                break
-            except Exception as exc:
-                err_short = f"#{idx} attempt {attempt}: {str(exc)[:55]}"
-                backoff = min(300, 35 * attempt + random.uniform(5, 15))
-                log_creator(job_id, f"Rate/API backoff {backoff:.0f}s ({str(exc)[:30]})", err=err_short)
+            cl: Client = job["client"]
+            count = int(job["count"])
+            title_tpl = str(job["title_template"])
+            target_name = str(job["target_name"])
+            usernames = list(job["usernames"])
+            send_ping = bool(job["send_ping"])
+            min_cd = float(job["min_cooldown"])
+            max_cd = float(job["max_cooldown"])
+
+        log_creator(job_id, f"Resolving {len(usernames)} username(s)...")
+        resolved_ids, failed_users = resolve_usernames_to_ids(cl, usernames)
+        if failed_users:
+            log_creator(job_id, f"Unresolved: {', '.join(failed_users)}", err="; ".join(failed_users))
+
+        if len(resolved_ids) < 2:
+            set_creator_running(job_id, False)
+            log_creator(
+                job_id,
+                f"Need >=2 valid usernames (resolved {len(resolved_ids)})",
+                err=f"Only resolved {len(resolved_ids)} user IDs from {usernames}",
+            )
+            return
+
+        log_creator(job_id, f"Resolved {len(resolved_ids)} users; creating {count} group(s)")
+
+        for idx in range(1, count + 1):
+            if not is_creator_running(job_id):
+                log_creator(job_id, "Stopped by user")
+                return
+
+            rendered_title = title_tpl.replace("{TARGET}", target_name).replace("{N}", str(idx)).strip()
+            if not rendered_title:
+                rendered_title = f"Group {idx}"
+
+            made = False
+            for attempt in range(1, MAX_RETRIES + 1):
+                if not is_creator_running(job_id):
+                    return
+                try:
+                    tid_str = _create_single_group(cl, rendered_title, resolved_ids, send_ping)
+                    log_creator(job_id, f"Created {idx}/{count} -> {tid_str}", created_id=tid_str)
+                    made = True
+                    break
+                except Exception as exc:
+                    err_short = f"#{idx} attempt {attempt}: {str(exc)[:55]}"
+                    backoff = min(300, 35 * attempt + random.uniform(5, 15))
+                    log_creator(job_id, f"Rate/API backoff {backoff:.0f}s ({str(exc)[:30]})", err=err_short)
+                    slept = 0.0
+                    while slept < backoff and is_creator_running(job_id):
+                        step = min(1.0, backoff - slept)
+                        time.sleep(step)
+                        slept += step
+
+            if not made and is_creator_running(job_id):
+                log_creator(job_id, f"Skipped group {idx}/{count} after retries")
+
+            if idx < count and is_creator_running(job_id):
+                delay = random.uniform(min_cd, max_cd)
+                log_creator(job_id, f"Cooldown {delay:.1f}s before group {idx + 1}/{count}")
                 slept = 0.0
-                while slept < backoff and is_creator_running(job_id):
-                    step = min(1.0, backoff - slept)
+                while slept < delay and is_creator_running(job_id):
+                    step = min(1.0, delay - slept)
                     time.sleep(step)
                     slept += step
 
-        if not made and is_creator_running(job_id):
-            log_creator(job_id, f"Skipped group {idx}/{count} after retries")
-
-        if idx < count and is_creator_running(job_id):
-            delay = random.uniform(min_cd, max_cd)
-            log_creator(job_id, f"Cooldown {delay:.1f}s before group {idx + 1}/{count}")
-            slept = 0.0
-            while slept < delay and is_creator_running(job_id):
-                step = min(1.0, delay - slept)
-                time.sleep(step)
-                slept += step
-
-    set_creator_running(job_id, False)
-    with tasks_lock:
-        done_n = group_creator_jobs.get(job_id, {}).get("created_count", 0)
-    log_creator(job_id, f"Completed ({done_n}/{count} created)")
+        set_creator_running(job_id, False)
+        with tasks_lock:
+            done_n = group_creator_jobs.get(job_id, {}).get("created_count", 0)
+        log_creator(job_id, f"Completed ({done_n}/{count} created)")
+    except Exception as exc:
+        set_creator_running(job_id, False)
+        log_creator(job_id, f"Creator crashed: {str(exc)[:80]}", err=traceback.format_exc()[-200:])
 
 
-# ======================== WORKER LOOP ========================
+# ======================== WORKER LOOP & MULTI-GC SENDER ========================
 
 def is_task_running(task_id: str) -> bool:
     with tasks_lock:
@@ -1224,6 +1366,7 @@ def set_task_running(task_id: str, running: bool):
     with tasks_lock:
         if task_id in active_tasks:
             active_tasks[task_id]["running"] = running
+    save_tasks_state_disk()
 
 
 def log_task(task_id: str, msg: str):
@@ -1236,19 +1379,21 @@ def log_task(task_id: str, msg: str):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {task_id}: {msg}", flush=True)
 
 
-def generate_slow_band():
-    low = random.uniform(25, 45)
-    spread = random.uniform(5, 15)
-    return (low, min(low + spread, 60))
-
-
-def next_delay(speed_mode: str, slow_band: tuple[float, float]) -> float:
+def next_delay(speed_mode: str) -> float:
+    """Fast mode: 8-10 seconds. Slow mode: 50-60 seconds."""
     if speed_mode == "fast":
-        return random.uniform(10, 20)
-    return random.uniform(slow_band[0], slow_band[1])
+        return random.uniform(8.0, 10.0)
+    return random.uniform(50.0, 60.0)
 
 
-def apply_group_names_once(task_id: str, cl: Client, thread_ids: list[str], target_name: str):
+def apply_group_names_once(
+    task_id: str,
+    cl: Optional[Client],
+    session_id: Optional[str],
+    ua: Optional[str],
+    thread_ids: list[str],
+    target_name: str,
+):
     title_tpl = get_active_group_title_template()
     new_title = title_tpl.replace("{TARGET}", target_name).strip()[:75]
     if not new_title:
@@ -1257,7 +1402,10 @@ def apply_group_names_once(task_id: str, cl: Client, thread_ids: list[str], targ
         if not is_task_running(task_id):
             break
         try:
-            cl.direct_thread_update_title(int(tid_str), new_title)
+            if cl is not None:
+                cl.direct_thread_update_title(int(tid_str), new_title)
+            elif session_id:
+                _ws_rename_only(session_id, ua or random.choice(WS_UA_POOL), tid_str, new_title)
             log_task(task_id, f"NC updated {tid_str} -> {new_title[:28]}")
         except Exception as exc:
             log_task(task_id, f"NC skip/err {tid_str}: {str(exc)[:35]}")
@@ -1269,104 +1417,345 @@ def apply_group_names_once(task_id: str, cl: Client, thread_ids: list[str], targ
                 slept += step
 
 
-def group_rename_loop(task_id: str, cl: Client, thread_ids: list[str], target_name: str):
-    """Changes group name one by one every 10-20 minutes (600-1200s) without instant multi-thread burst."""
+def group_rename_loop(
+    task_id: str,
+    cl: Optional[Client],
+    session_id: Optional[str],
+    ua: Optional[str],
+    thread_ids: list[str],
+    target_name: str,
+):
+    """Changes group name one by one every 10-20 minutes (600-1200s)."""
     while is_task_running(task_id):
-        interval = random.uniform(600, 1200)
-        slept = 0.0
-        while slept < interval and is_task_running(task_id):
-            step = min(1.0, interval - slept)
-            time.sleep(step)
-            slept += step
+        try:
+            interval = random.uniform(600, 1200)
+            slept = 0.0
+            while slept < interval and is_task_running(task_id):
+                step = min(1.0, interval - slept)
+                time.sleep(step)
+                slept += step
 
-        if not is_task_running(task_id):
-            break
+            if not is_task_running(task_id):
+                break
 
-        apply_group_names_once(task_id, cl, thread_ids, target_name)
+            apply_group_names_once(task_id, cl, session_id, ua, thread_ids, target_name)
+        except Exception as exc:
+            log_task(task_id, f"NC loop err: {str(exc)[:40]}")
+            time.sleep(15)
 
 
 def worker_loop(task_id: str):
     global GLOBAL_MESSAGES_SENT
-    with tasks_lock:
-        task = active_tasks.get(task_id)
-        if not task:
-            return
-        cl: Client = task["client"]
-        thread_ids = list(task["thread_ids"])
-        target_name = task["target_name"]
-        speed_mode = task.get("speed_mode", "slow")
-        use_nc = bool(task.get("use_nc", True))
+    try:
+        with tasks_lock:
+            task = active_tasks.get(task_id)
+            if not task:
+                return
+            cl: Optional[Client] = task.get("client")
+            session_id: Optional[str] = task.get("session_id")
+            ua: str = task.get("ua") or random.choice(WS_UA_POOL)
+            thread_ids = list(task["thread_ids"])
+            target_name = task["target_name"]
+            speed_mode = task.get("speed_mode", "slow")
+            use_nc = bool(task.get("use_nc", True))
 
-    if use_nc:
-        renamer = threading.Thread(
-            target=group_rename_loop,
-            args=(task_id, cl, thread_ids, target_name),
-            daemon=True,
-        )
-        renamer.start()
+        if use_nc:
+            renamer = threading.Thread(
+                target=group_rename_loop,
+                args=(task_id, cl, session_id, ua, thread_ids, target_name),
+                daemon=True,
+            )
+            renamer.start()
 
-    single_line_tpl = get_active_single_line_template()
+        single_line_tpl = get_active_single_line_template()
+        round_num = 0
 
-    slow_band = generate_slow_band()
-    last_band_change = time.time()
-    band_interval = random.uniform(3600, 7200)
-    round_num = 0
-
-    while is_task_running(task_id):
-        try:
-            round_num += 1
-            nc_label = "NC:ON" if use_nc else "NC:OFF"
-            log_task(task_id, f"Round {round_num} started ({speed_mode}, {nc_label})")
-            for tid_str in thread_ids:
-                if not is_task_running(task_id):
-                    break
-
-                expanded_msg = build_expanded_message(single_line_tpl, target_name)
-                subtle_link = make_subtle_z_link()
-                payload = (
-                    f"{subtle_link}\n\n{expanded_msg}"
-                    if random.choice([True, False])
-                    else f"{expanded_msg}\n\n{subtle_link}"
-                )
-
-                sent = False
-                for attempt in range(1, MAX_RETRIES + 1):
+        while is_task_running(task_id):
+            try:
+                round_num += 1
+                nc_label = "NC:ON" if use_nc else "NC:OFF"
+                log_task(task_id, f"Round {round_num} started ({speed_mode}, {nc_label})")
+                for tid_str in thread_ids:
                     if not is_task_running(task_id):
                         break
+
+                    expanded_msg = build_expanded_message(single_line_tpl, target_name)
+                    subtle_link = make_subtle_z_link()
+                    payload = (
+                        f"{subtle_link}\n\n{expanded_msg}"
+                        if random.choice([True, False])
+                        else f"{expanded_msg}\n\n{subtle_link}"
+                    )
+
+                    sent = False
+                    for attempt in range(1, MAX_RETRIES + 1):
+                        if not is_task_running(task_id):
+                            break
+                        try:
+                            if cl is not None:
+                                cl.direct_send(payload, thread_ids=[int(tid_str)])
+                            elif session_id:
+                                ok, _, err_m = _send_and_rename_ws_gc(session_id, ua, tid_str, payload, None)
+                                if not ok:
+                                    raise RuntimeError(err_m or "WS/REST send failed")
+                            else:
+                                raise RuntimeError("No active client or session_id")
+
+                            with tasks_lock:
+                                GLOBAL_MESSAGES_SENT += 1
+                                if task_id in active_tasks:
+                                    active_tasks[task_id]["msg_count"] += 1
+                            log_task(task_id, f"Sent to {tid_str}")
+                            sent = True
+                            break
+                        except Exception as exc:
+                            wait = min(120, 20 * attempt)
+                            log_task(task_id, f"Retry {attempt}/{MAX_RETRIES} ({str(exc)[:35]}) in {wait}s")
+                            slept_w = 0.0
+                            while slept_w < wait and is_task_running(task_id):
+                                time.sleep(min(1.0, wait - slept_w))
+                                slept_w += 1.0
+
+                    if not sent and is_task_running(task_id):
+                        log_task(task_id, f"Skipped thread {tid_str} after retries")
+
+                    delay = next_delay(speed_mode)
+                    log_task(task_id, f"Cooldown {delay:.1f}s ({speed_mode})")
+                    slept = 0.0
+                    while slept < delay and is_task_running(task_id):
+                        step = min(1.0, delay - slept)
+                        time.sleep(step)
+                        slept += step
+
+                if round_num % 10 == 0:
+                    save_tasks_state_disk()
+                    gc.collect()
+            except Exception as exc:
+                log_task(task_id, f"Loop error: {str(exc)[:40]} (resting 30s)")
+                time.sleep(30)
+    finally:
+        set_task_running(task_id, False)
+        log_task(task_id, "Stopped")
+
+
+def is_multi_gc_running(job_id: str) -> bool:
+    with tasks_lock:
+        return bool(multi_gc_jobs.get(job_id, {}).get("running", False))
+
+
+def set_multi_gc_running(job_id: str, running: bool):
+    with tasks_lock:
+        if job_id in multi_gc_jobs:
+            multi_gc_jobs[job_id]["running"] = running
+    save_tasks_state_disk()
+
+
+def log_multi_gc(job_id: str, msg: str, sent_inc: int = 0, rename_inc: int = 0):
+    global GLOBAL_MESSAGES_SENT
+    with tasks_lock:
+        job = multi_gc_jobs.get(job_id)
+        if not job:
+            return
+        if sent_inc > 0:
+            job["msg_count"] += sent_inc
+            GLOBAL_MESSAGES_SENT += sent_inc
+        if rename_inc > 0:
+            job["rename_count"] += rename_inc
+        job["last_event"] = msg
+        job["last_update"] = datetime.now().strftime("%H:%M:%S")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] MGC {job_id}: {msg}", flush=True)
+
+
+def _ws_rename_only(session_id: str, ua: str, tid_str: str, nc_title: str):
+    if IGRAPIWEB_AVAILABLE and make_ig_web_socket is not None:
+        sock = None
+        try:
+            sock = make_ig_web_socket(sessionid=session_id, user_agent=ua)
+            for mode in ("dgw", "iris"):
+                try:
+                    sock.connect(dm_receive=mode)
+                    break
+                except Exception:
+                    continue
+            sock.rename_group(str(tid_str), nc_title[:75])
+            return
+        finally:
+            if sock is not None:
+                try:
+                    sock.disconnect()
+                except Exception:
+                    pass
+    raise RuntimeError("igrapiweb unavailable for WS rename")
+
+
+def _send_and_rename_ws_gc(
+    session_id: str,
+    ua: str,
+    tid_str: str,
+    text_body: str,
+    nc_title: Optional[str],
+) -> tuple[bool, bool, str]:
+    """Sends text and optionally renames GC using WS socket (with REST fallback for send)."""
+    sent_ok = False
+    renamed_ok = False
+    err_msg = ""
+
+    if IGRAPIWEB_AVAILABLE and make_ig_web_socket is not None:
+        sock = None
+        try:
+            sock = make_ig_web_socket(sessionid=session_id, user_agent=ua)
+            connected = False
+            for mode in ("dgw", "iris"):
+                try:
+                    sock.connect(dm_receive=mode)
+                    connected = True
+                    break
+                except Exception:
+                    continue
+            if connected:
+                res = sock.send_message(str(tid_str), {"text": text_body})
+                if isinstance(res, dict) and (res.get("ok") is True or "message_id" in str(res)):
+                    sent_ok = True
+                elif res is not None:
+                    sent_ok = True
+                if nc_title:
                     try:
-                        cl.direct_send(payload, thread_ids=[int(tid_str)])
-                        with tasks_lock:
-                            GLOBAL_MESSAGES_SENT += 1
-                            if task_id in active_tasks:
-                                active_tasks[task_id]["msg_count"] += 1
-                        log_task(task_id, f"Sent to {tid_str}")
-                        sent = True
-                        break
+                        sock.rename_group(str(tid_str), nc_title[:75])
+                        renamed_ok = True
                     except Exception as exc:
-                        wait = 30 * attempt
-                        log_task(task_id, f"Retry {attempt}/{MAX_RETRIES} ({str(exc)[:35]}) in {wait}s")
-                        time.sleep(wait)
-
-                if not sent and is_task_running(task_id):
-                    log_task(task_id, f"Skipped thread {tid_str} after retries")
-
-                delay = next_delay(speed_mode, slow_band)
-                log_task(task_id, f"Cooldown {delay:.1f}s ({speed_mode})")
-                slept = 0.0
-                while slept < delay and is_task_running(task_id):
-                    step = min(1.0, delay - slept)
-                    time.sleep(step)
-                    slept += step
-
-                if speed_mode == "slow" and (time.time() - last_band_change >= band_interval):
-                    slow_band = generate_slow_band()
-                    last_band_change = time.time()
-                    band_interval = random.uniform(3600, 7200)
+                        err_msg = f"nc:{str(exc)[:50]}"
         except Exception as exc:
-            log_task(task_id, f"Loop error: {str(exc)[:40]} (resting 60s)")
-            time.sleep(60)
+            err_msg = str(exc)[:80]
+        finally:
+            if sock is not None:
+                try:
+                    sock.disconnect()
+                except Exception:
+                    pass
 
-    log_task(task_id, "Stopped")
+    if not sent_ok:
+        try:
+            with requests.Session() as sess:
+                resp = sess.post(
+                    "https://www.instagram.com/api/v1/direct_v2/threads/broadcast/text/",
+                    headers={
+                        "User-Agent": ua,
+                        "X-IG-App-ID": "936619743392459",
+                        "Referer": f"https://www.instagram.com/direct/t/{tid_str}/",
+                    },
+                    cookies={"sessionid": session_id},
+                    data={"thread_ids": f"[{tid_str}]", "text": text_body},
+                    timeout=12,
+                )
+                if resp.status_code in (200, 201):
+                    sent_ok = True
+                    err_msg = ""
+                else:
+                    err_msg = f"HTTP {resp.status_code}"
+        except Exception as exc:
+            err_msg = str(exc)[:80]
+
+    return sent_ok, renamed_ok, err_msg
+
+
+def multi_gc_loop(job_id: str):
+    """Sends text to each GC, optionally changes that GC's name right after sending, then waits 8-10s (fast) or 50-60s (slow)."""
+    try:
+        with tasks_lock:
+            job = multi_gc_jobs.get(job_id)
+            if not job:
+                return
+            cl: Optional[Client] = job.get("client")
+            session_id: Optional[str] = job.get("session_id")
+            ua: str = job.get("ua") or random.choice(WS_UA_POOL)
+            thread_ids = list(job["thread_ids"])
+            target_name = job["target_name"]
+            custom_text = (job.get("custom_text") or "").strip()
+            nc_text = (job.get("nc_text") or "").strip()
+            speed_mode = job.get("speed_mode", "slow")
+            use_nc = bool(job.get("use_nc", True))
+
+        single_line_tpl = get_active_single_line_template()
+        title_tpl = get_active_group_title_template()
+        round_num = 0
+
+        while is_multi_gc_running(job_id):
+            try:
+                round_num += 1
+                log_multi_gc(job_id, f"Round {round_num} ({speed_mode}, {'with NC' if use_nc else 'without NC'})")
+
+                for tid_str in thread_ids:
+                    if not is_multi_gc_running(job_id):
+                        break
+
+                    if custom_text:
+                        link = make_subtle_z_link()
+                        emoji = random.choice(WS_EMOJI_POOL)
+                        payload = f"{link}\n\n{custom_text} !! {emoji} !!{WS_FOOTER}"
+                    else:
+                        expanded = build_expanded_message(single_line_tpl, target_name)
+                        link = make_subtle_z_link()
+                        payload = f"{link}\n\n{expanded}"
+
+                    nc_title = None
+                    if use_nc:
+                        base_nc = nc_text if nc_text else title_tpl
+                        nc_title = base_nc.replace("{TARGET}", target_name).strip()[:75] or target_name[:75] or "GC"
+
+                    sent_ok = False
+                    renamed_ok = False
+                    last_err = ""
+
+                    if cl is not None:
+                        try:
+                            cl.direct_send(payload, thread_ids=[int(tid_str)])
+                            sent_ok = True
+                        except Exception as exc:
+                            last_err = str(exc)[:60]
+
+                        if use_nc and nc_title:
+                            try:
+                                cl.direct_thread_update_title(int(tid_str), nc_title)
+                                renamed_ok = True
+                            except Exception as exc:
+                                last_err = f"{last_err}; nc:{str(exc)[:40]}".strip("; ")
+                    elif session_id:
+                        sent_ok, renamed_ok, last_err = _send_and_rename_ws_gc(
+                            session_id=session_id,
+                            ua=ua,
+                            tid_str=tid_str,
+                            text_body=payload,
+                            nc_title=nc_title if use_nc else None,
+                        )
+
+                    if sent_ok:
+                        status_str = f"Sent -> {tid_str}"
+                        if use_nc:
+                            status_str += (" + NC" if renamed_ok else " (NC err)")
+                        log_multi_gc(job_id, status_str, sent_inc=1, rename_inc=1 if renamed_ok else 0)
+                    else:
+                        log_multi_gc(job_id, f"Err {tid_str}: {last_err[:45]}")
+
+                    if not is_multi_gc_running(job_id):
+                        break
+
+                    delay = next_delay(speed_mode)
+                    log_multi_gc(job_id, f"Next in {delay:.1f}s ({speed_mode})")
+                    slept = 0.0
+                    while slept < delay and is_multi_gc_running(job_id):
+                        step = min(0.5, delay - slept)
+                        time.sleep(step)
+                        slept += step
+
+                if round_num % 10 == 0:
+                    save_tasks_state_disk()
+                    gc.collect()
+            except Exception as exc:
+                log_multi_gc(job_id, f"Loop err: {str(exc)[:45]} (resting 15s)")
+                time.sleep(15)
+    finally:
+        set_multi_gc_running(job_id, False)
+        log_multi_gc(job_id, "Stopped")
 
 
 # ======================== REQUEST SCHEMAS ========================
@@ -1382,9 +1771,23 @@ class PasswordLoginReq(BaseModel):
 
 
 class StartTaskReq(BaseModel):
-    username: str
+    username: Optional[str] = None
+    ws_uid: Optional[str] = None
+    session_id: Optional[str] = None
     thread_ids: list[str]
     target_name: str
+    speed_mode: Optional[str] = "slow"
+    use_nc: Optional[bool] = True
+
+
+class StartMultiGcReq(BaseModel):
+    username: Optional[str] = None
+    ws_uid: Optional[str] = None
+    session_id: Optional[str] = None
+    thread_ids: list[str]
+    target_name: Optional[str] = ""
+    custom_text: Optional[str] = ""
+    nc_text: Optional[str] = ""
     speed_mode: Optional[str] = "slow"
     use_nc: Optional[bool] = True
 
@@ -1432,6 +1835,21 @@ class WsAddReq(BaseModel):
     auto_start: Optional[bool] = True
 
 
+class WsEditReq(BaseModel):
+    session_name: Optional[str] = None
+    session_id: Optional[str] = None
+    gc_name_text: Optional[str] = None
+    msg_text: Optional[str] = None
+    thread_id: Optional[str] = None
+    thread_ids: Optional[list[str]] = None
+    socket_pool: Optional[int] = None
+    delay_min: Optional[float] = None
+    delay_max: Optional[float] = None
+    rename_min: Optional[float] = None
+    rename_max: Optional[float] = None
+    auto_start: Optional[bool] = None
+
+
 class WsAdjustReq(BaseModel):
     msg_delta: Optional[float] = None
     rename_delta: Optional[float] = None
@@ -1441,10 +1859,39 @@ class WsSocketsReq(BaseModel):
     socket_pool: int
 
 
+# ======================== AUTH / SESSION RESOLUTION ========================
+
+def _resolve_sender_auth(username: Optional[str], ws_uid: Optional[str], session_id: Optional[str]):
+    """Returns (client_or_none, session_id_or_none, ua_or_none, label)."""
+    raw_sid = clean_session_id(session_id or "")
+    if raw_sid:
+        return None, raw_sid, random.choice(WS_UA_POOL), "sessionid"
+
+    uid_clean = (ws_uid or "").strip()
+    if uid_clean:
+        with ws_lock:
+            w = ws_sessions.get(uid_clean)
+        if not w:
+            raise RuntimeError(f"WS session '{uid_clean}' not found.")
+        return None, clean_session_id(w.data.get("session_id", "")), w.data.get("ua"), f"WS:{w.data.get('session_name', uid_clean)}"
+
+    uname = (username or "").strip().lstrip("@")
+    if uname:
+        cl = get_or_resume_client(uname)
+        return cl, None, None, f"@{uname}"
+
+    with ws_lock:
+        first_w = next(iter(ws_sessions.values()), None)
+    if first_w and first_w.data.get("session_id"):
+        return None, clean_session_id(first_w.data["session_id"]), first_w.data.get("ua"), f"WS:{first_w.data.get('session_name', 'ws')}"
+
+    raise RuntimeError("Select a WS login session, saved account, or enter a Session ID.")
+
+
 # ======================== API ROUTES ========================
 
 @app.get("/api/state")
-def api_state(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
+async def api_state(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
     verify_auth(x_panel_token, token)
     cpu = psutil.cpu_percent(interval=None)
     ram = psutil.virtual_memory()
@@ -1466,6 +1913,22 @@ def api_state(x_panel_token: Optional[str] = Header(default=None), token: Option
             }
             for tid, info in active_tasks.items()
         ]
+        multi_gc_view = [
+            {
+                "job_id": jid,
+                "label": j.get("label", ""),
+                "target_name": j.get("target_name", ""),
+                "thread_ids": [str(x) for x in j.get("thread_ids", [])],
+                "speed_mode": j.get("speed_mode", "slow"),
+                "use_nc": bool(j.get("use_nc", True)),
+                "running": bool(j.get("running", False)),
+                "msg_count": j.get("msg_count", 0),
+                "rename_count": j.get("rename_count", 0),
+                "last_event": j.get("last_event", ""),
+                "last_update": j.get("last_update", ""),
+            }
+            for jid, j in multi_gc_jobs.items()
+        ]
         creator_view = [
             {
                 "job_id": jid,
@@ -1480,7 +1943,10 @@ def api_state(x_panel_token: Optional[str] = Header(default=None), token: Option
             }
             for jid, j in group_creator_jobs.items()
         ]
-        running_count = sum(1 for t in active_tasks.values() if t.get("running"))
+        running_count = (
+            sum(1 for t in active_tasks.values() if t.get("running"))
+            + sum(1 for j in multi_gc_jobs.values() if j.get("running"))
+        )
 
     with ws_lock:
         ws_view = []
@@ -1512,6 +1978,7 @@ def api_state(x_panel_token: Optional[str] = Header(default=None), token: Option
         "group_title_template": get_active_group_title_template(),
         "is_custom_template": os.path.exists(TEMPLATE_FILE),
         "tasks": tasks_view,
+        "multi_gc_jobs": multi_gc_view,
         "group_creator_jobs": creator_view,
         "ws_sessions": ws_view,
         "igrapiweb_available": IGRAPIWEB_AVAILABLE,
@@ -1634,6 +2101,74 @@ def api_ws_add(
     }
 
 
+@app.patch("/api/ws/sessions/{uid}")
+def api_ws_edit(
+    uid: str,
+    body: WsEditReq,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    with ws_lock:
+        w = ws_sessions.get(uid)
+    if not w:
+        raise HTTPException(status_code=404, detail="WS session not found.")
+
+    was_live = w.get_stats().get("status") == "live"
+    if was_live:
+        w.stop()
+
+    if body.session_name is not None and body.session_name.strip():
+        w.data["session_name"] = body.session_name.strip()
+    if body.session_id is not None and body.session_id.strip():
+        w.data["session_id"] = clean_session_id(body.session_id)
+    if body.gc_name_text is not None and body.gc_name_text.strip():
+        w.data["gc_name_text"] = body.gc_name_text.strip()
+    if body.msg_text is not None and body.msg_text.strip():
+        w.data["msg_text"] = body.msg_text.strip()
+
+    if body.thread_ids is not None:
+        tids = parse_thread_ids(body.thread_ids)
+        if tids:
+            w.data["thread_ids"] = tids
+            w.data["thread_id"] = tids[0]
+    if body.thread_id is not None and body.thread_id.strip().isdigit():
+        tid_clean = body.thread_id.strip()
+        w.data["thread_id"] = tid_clean
+        cur_tids = parse_thread_ids(w.data.get("thread_ids") or [])
+        if tid_clean not in cur_tids:
+            cur_tids.insert(0, tid_clean)
+        w.data["thread_ids"] = cur_tids
+
+    if body.delay_min is not None:
+        w.data["delay_min"] = max(0.01, float(body.delay_min))
+    if body.delay_max is not None:
+        w.data["delay_max"] = max(float(w.data.get("delay_min", 0.01)), float(body.delay_max))
+    if body.rename_min is not None:
+        w.data["rename_min"] = max(1.0, float(body.rename_min))
+    if body.rename_max is not None:
+        w.data["rename_max"] = max(float(w.data.get("rename_min", 1.0)), float(body.rename_max))
+    if body.socket_pool is not None:
+        w.set_socket_pool_size(body.socket_pool)
+    if body.auto_start is not None:
+        w.data["auto_start"] = bool(body.auto_start)
+
+    save_ws_sessions_disk()
+
+    restarted = False
+    restart_err = None
+    if was_live or w.data.get("auto_start"):
+        restarted, restart_err = w.start()
+
+    return {
+        "ok": True,
+        "uid": uid,
+        "restarted": restarted,
+        "error": restart_err,
+        "stats": w.get_stats(),
+    }
+
+
 @app.post("/api/ws/sessions/{uid}/start")
 def api_ws_start(
     uid: str,
@@ -1741,7 +2276,7 @@ def api_ws_delete(
     return {"ok": True, "deleted": uid}
 
 
-# ---------- Existing Instagrapi & Group Endpoints ----------
+# ---------- Existing Instagrapi, Thread Fetcher & Group Endpoints ----------
 
 @app.post("/api/login/session")
 def api_login_session(
@@ -1823,6 +2358,24 @@ def api_delete_account(
     verify_auth(x_panel_token, token)
     delete_saved_account(username)
     return {"ok": True, "removed": username}
+
+
+@app.get("/api/threads")
+def api_threads_query(
+    username: Optional[str] = None,
+    ws_uid: Optional[str] = None,
+    session_id: Optional[str] = None,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    try:
+        cl, sid, ua, _ = _resolve_sender_auth(username, ws_uid, session_id)
+        if cl is not None:
+            return {"ok": True, "threads": list_threads(cl)}
+        return {"ok": True, "threads": fetch_threads_via_sessionid(sid or "", ua=ua)}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {str(exc)[:180]}")
 
 
 @app.get("/api/threads/{username}")
@@ -2004,19 +2557,17 @@ def api_start_task(
     token: Optional[str] = None,
 ):
     verify_auth(x_panel_token, token)
-    uname = body.username.strip().lstrip("@")
     target = body.target_name.strip()
     tids = parse_thread_ids(body.thread_ids)
     speed = (body.speed_mode or "slow").strip().lower()
     use_nc = bool(True if body.use_nc is None else body.use_nc)
     if speed not in ("slow", "fast"):
         raise HTTPException(status_code=400, detail="speed_mode must be 'slow' or 'fast'.")
-
-    if not uname or not target or not tids:
-        raise HTTPException(status_code=400, detail="Username, target name, and at least 1 valid numeric thread ID required.")
+    if not target or not tids:
+        raise HTTPException(status_code=400, detail="Target name and at least 1 valid numeric thread ID required.")
 
     try:
-        cl = get_or_resume_client(uname)
+        cl, sid, ua, label = _resolve_sender_auth(body.username, body.ws_uid, body.session_id)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -2024,17 +2575,22 @@ def api_start_task(
     with tasks_lock:
         active_tasks[task_id] = {
             "client": cl,
-            "username": uname,
+            "session_id": sid,
+            "ua": ua,
+            "raw_username": (body.username or "").strip().lstrip("@") or None,
+            "ws_uid": (body.ws_uid or "").strip() or None,
+            "username": label,
             "thread_ids": tids,
             "target_name": target,
             "speed_mode": speed,
             "use_nc": use_nc,
             "running": True,
             "msg_count": 0,
-            "last_event": "Queued (NC 10-20m one-by-one)" if use_nc else "Queued (Without NC)",
+            "last_event": f"Queued ({speed}, {'with NC' if use_nc else 'no NC'})",
             "last_update": datetime.now().strftime("%H:%M:%S"),
         }
 
+    save_tasks_state_disk()
     threading.Thread(target=worker_loop, args=(task_id,), daemon=True).start()
     return {"ok": True, "task_id": task_id, "speed_mode": speed, "use_nc": use_nc, "thread_ids": tids}
 
@@ -2050,14 +2606,82 @@ def api_stop_task(
     return {"ok": True, "task_id": task_id}
 
 
+@app.post("/api/multi-gc/start")
+def api_start_multi_gc(
+    body: StartMultiGcReq,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    tids = parse_thread_ids(body.thread_ids)
+    target = (body.target_name or "").strip()
+    custom_text = (body.custom_text or "").strip()
+    nc_text = (body.nc_text or "").strip()
+    speed = (body.speed_mode or "slow").strip().lower()
+    use_nc = bool(True if body.use_nc is None else body.use_nc)
+
+    if speed not in ("slow", "fast"):
+        raise HTTPException(status_code=400, detail="speed_mode must be 'slow' or 'fast'.")
+    if len(tids) < 1:
+        raise HTTPException(status_code=400, detail="Select or enter at least 1 valid numeric GC thread ID.")
+    if not target and not custom_text:
+        raise HTTPException(status_code=400, detail="Enter a target name or custom text to send.")
+
+    try:
+        cl, sid, ua, label = _resolve_sender_auth(body.username, body.ws_uid, body.session_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    job_id = f"M{uuid.uuid4().hex[:6].upper()}"
+    with tasks_lock:
+        multi_gc_jobs[job_id] = {
+            "job_id": job_id,
+            "client": cl,
+            "username": (body.username or "").strip().lstrip("@") or None,
+            "ws_uid": (body.ws_uid or "").strip() or None,
+            "session_id": sid,
+            "ua": ua,
+            "label": label,
+            "thread_ids": tids,
+            "target_name": target or custom_text[:30],
+            "custom_text": custom_text,
+            "nc_text": nc_text,
+            "speed_mode": speed,
+            "use_nc": use_nc,
+            "running": True,
+            "msg_count": 0,
+            "rename_count": 0,
+            "last_event": f"Queued ({len(tids)} GCs, {speed}, {'with NC' if use_nc else 'no NC'})",
+            "last_update": datetime.now().strftime("%H:%M:%S"),
+        }
+
+    save_tasks_state_disk()
+    threading.Thread(target=multi_gc_loop, args=(job_id,), daemon=True).start()
+    return {"ok": True, "job_id": job_id, "thread_ids": tids, "speed_mode": speed, "use_nc": use_nc}
+
+
+@app.post("/api/multi-gc/{job_id}/stop")
+def api_stop_multi_gc(
+    job_id: str,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    set_multi_gc_running(job_id, False)
+    return {"ok": True, "job_id": job_id}
+
+
 @app.post("/api/tasks/stop-all")
 def api_stop_all(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
     verify_auth(x_panel_token, token)
     with tasks_lock:
         for info in active_tasks.values():
             info["running"] = False
+        for job in multi_gc_jobs.values():
+            job["running"] = False
         for job in group_creator_jobs.values():
             job["running"] = False
+    save_tasks_state_disk()
     with ws_lock:
         ws_workers = list(ws_sessions.values())
     for w in ws_workers:
@@ -2206,6 +2830,8 @@ HTML_PAGE = """<!DOCTYPE html>
     details { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
     summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
     .toast { position: fixed; bottom: 18px; right: 18px; background: #1f2937; border: 1px solid var(--border); padding: 10px 14px; border-radius: 8px; display: none; z-index: 50; max-width: 420px; }
+    .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.72); display: none; align-items: center; justify-content: center; z-index: 60; padding: 16px; }
+    .modal-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; width: 100%; max-width: 520px; max-height: 90vh; overflow-y: auto; }
   </style>
 </head>
 <body>
@@ -2253,12 +2879,13 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
 
       <div class="card">
-        <h2>2. Start Task & Group Selector</h2>
-        <label>Account</label>
+        <h2>2. Start Task & GC / Chat Fetcher</h2>
+        <label>Login Source (WS Session or Saved Account)</label>
         <select id="taskAccount" onchange="syncAccountSelectors(this.value)"></select>
 
         <div class="row">
-          <button class="secondary" onclick="fetchThreads()">Load Chats / Groups</button>
+          <button class="secondary" onclick="fetchThreads(true)">Fetch GC List</button>
+          <button class="secondary" onclick="fetchThreads(false)">Fetch All Chats</button>
           <button class="secondary" onclick="selectAllLoaded(true)">Select All</button>
           <button class="secondary" onclick="selectAllLoaded(false)">Clear</button>
           <span class="muted" id="threadStatus"></span>
@@ -2266,8 +2893,8 @@ HTML_PAGE = """<!DOCTYPE html>
 
         <div id="threadPicker" class="picker-box"></div>
 
-        <label>Selected Thread IDs (auto-filled or paste comma-separated IDs)</label>
-        <input id="threadIdsInput" type="text" placeholder="Tap chats above or paste full numeric IDs" />
+        <label>Thread IDs (pick from GC list above or paste comma-separated IDs)</label>
+        <input id="threadIdsInput" type="text" placeholder="Fetched GCs appear above, or paste numeric Thread IDs" />
 
         <label>Target Name ({TARGET})</label>
         <input id="targetInput" placeholder="Enter target name" />
@@ -2276,14 +2903,14 @@ HTML_PAGE = """<!DOCTYPE html>
           <div>
             <label>Message Speed</label>
             <select id="speedMode">
-              <option value="slow" selected>Slow (25–45s + spread)</option>
-              <option value="fast">Fast (10–20s delay)</option>
+              <option value="slow" selected>Slow (50–60s)</option>
+              <option value="fast">Fast (8–10s)</option>
             </select>
           </div>
           <div>
             <label>Name Change (NC) Mode</label>
             <select id="ncMode">
-              <option value="true" selected>With NC (one-by-one 10–20m)</option>
+              <option value="true" selected>With NC</option>
               <option value="false">Without NC</option>
             </select>
           </div>
@@ -2293,9 +2920,58 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
     </div>
 
+    <div class="card">
+      <h2>3. Multi-GC Text + NC Sender (Separate Feature)</h2>
+      <div class="muted">Sends text to each selected/entered GC, then optionally changes that GC's name (With NC / Without NC) before moving to the next GC. Uses the same WS login session.</div>
+
+      <div class="grid-2" style="margin-top:8px;">
+        <div>
+          <label>WS Session / Login</label>
+          <select id="mgcLoginSelect"></select>
+
+          <label>Target Name ({TARGET}) or Custom Text</label>
+          <input id="mgcTargetInput" placeholder="Target name for template (or leave blank if using custom text)" />
+
+          <label>Custom Message Text (optional — uses template if blank)</label>
+          <input id="mgcCustomText" placeholder="Optional custom message text" />
+        </div>
+        <div>
+          <label>GC Thread IDs (uses Selected Thread IDs above if left blank)</label>
+          <input id="mgcThreadIdsInput" placeholder="Leave blank to use Selected Thread IDs, or paste comma-separated GC IDs" />
+
+          <div class="two-col-inline">
+            <div>
+              <label>Speed Mode</label>
+              <select id="mgcSpeedMode">
+                <option value="fast" selected>Fast (8–10s)</option>
+                <option value="slow">Slow (50–60s)</option>
+              </select>
+            </div>
+            <div>
+              <label>NC Option</label>
+              <select id="mgcNcMode">
+                <option value="true" selected>With NC (send text then rename GC)</option>
+                <option value="false">Without NC (send text only)</option>
+              </select>
+            </div>
+          </div>
+
+          <label>New GC Name Text (optional — defaults to Group Name Template / Target)</label>
+          <input id="mgcNcText" placeholder="Optional GC name after sending text" />
+        </div>
+      </div>
+
+      <div class="row">
+        <button onclick="startMultiGc()">Start Multi-GC Sender</button>
+        <button class="secondary" onclick="fillMultiGcFromSelected()">Copy Selected GCs</button>
+      </div>
+
+      <div id="multiGcJobsList" class="muted" style="margin-top:10px;">No Multi-GC sender jobs yet.</div>
+    </div>
+
     <div class="grid-2">
       <div class="card">
-        <h2>3. Group Chat Creator (With Cooldowns)</h2>
+        <h2>4. Group Chat Creator (With Cooldowns)</h2>
         <div class="muted">Enter at least <strong>2 usernames</strong>. Resolves usernames to IDs and creates groups with cooldowns.</div>
         <label>Account</label>
         <select id="gcCreatorAccount"></select>
@@ -2343,7 +3019,7 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
 
       <div class="card">
-        <h2>4. Mobile Group Invite Link Extractor</h2>
+        <h2>5. Mobile Group Invite Link Extractor</h2>
         <div class="muted">Extracts mobile invite links for the selected/entered group IDs above.</div>
         <label>Account</label>
         <select id="inviteAccount"></select>
@@ -2363,8 +3039,8 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>5. WebSocket Multi-Sender (igrapiweb)</h2>
-      <div class="muted" id="wsMetaBar">Separate WebSocket worker engine (socket pool, live socket scaling, dgw/iris fallback, rotation & health checks).</div>
+      <h2>6. WebSocket Multi-Sender (igrapiweb)</h2>
+      <div class="muted" id="wsMetaBar">Separate WebSocket worker engine (socket pool, live socket scaling, editable sessions, rotation & health checks).</div>
 
       <div class="grid-2" style="margin-top:10px;">
         <div>
@@ -2421,12 +3097,12 @@ HTML_PAGE = """<!DOCTYPE html>
 
     <div class="grid-2">
       <div class="card">
-        <h2>6. Active Tasks</h2>
+        <h2>7. Active Tasks</h2>
         <div id="tasksList" class="muted">No tasks yet.</div>
       </div>
 
       <div class="card">
-        <h2>7. Message & Group Rename Templates</h2>
+        <h2>8. Message & Group Rename Templates</h2>
         <div class="muted">Enter <strong>one line</strong> using <code>{TARGET}</code>. Picks a random emoji for <code>-🌒-</code> on each of the 11 lines.</div>
         <label>Single Line Message Template</label>
         <input id="templateLineInput" type="text" placeholder="<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌒-" />
@@ -2442,7 +3118,7 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>8. Add User to Selected Group (With Safety Cooldown)</h2>
+      <h2>9. Add User to Selected Group (With Safety Cooldown)</h2>
       <div class="muted">Adds a specific user (numeric IG ID or <code>@username</code>) to selected group threads with a minimum <strong>20s safety cooldown</strong> between groups.</div>
       <div class="grid-2" style="margin-top:8px;">
         <div>
@@ -2469,6 +3145,63 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Edit WS Session Modal -->
+  <div class="modal-backdrop" id="wsEditModal">
+    <div class="modal-card">
+      <h2>Edit WS Session</h2>
+      <input type="hidden" id="editWsUid" />
+      <label>Session Name</label>
+      <input id="editWsName" />
+      <label>New Session ID (leave blank to keep existing)</label>
+      <input id="editWsSid" type="password" placeholder="Optional new sessionid" />
+      <label>GC Name Text</label>
+      <input id="editWsGcName" />
+      <label>Message Text</label>
+      <input id="editWsMsgText" />
+      <div class="two-col-inline">
+        <div>
+          <label>Primary Thread ID</label>
+          <input id="editWsThreadId" />
+        </div>
+        <div>
+          <label>Sockets (1–10)</label>
+          <input id="editWsSockets" type="number" min="1" max="10" />
+        </div>
+      </div>
+      <label>All Thread IDs (comma-separated)</label>
+      <input id="editWsThreadIds" />
+      <div class="two-col-inline">
+        <div>
+          <label>Msg Min Delay (s)</label>
+          <input id="editWsDelayMin" type="number" step="0.01" min="0.01" />
+        </div>
+        <div>
+          <label>Msg Max Delay (s)</label>
+          <input id="editWsDelayMax" type="number" step="0.01" min="0.01" />
+        </div>
+      </div>
+      <div class="two-col-inline">
+        <div>
+          <label>Rename Min Delay (s)</label>
+          <input id="editWsRenameMin" type="number" step="0.5" min="1" />
+        </div>
+        <div>
+          <label>Rename Max Delay (s)</label>
+          <input id="editWsRenameMax" type="number" step="0.5" min="1" />
+        </div>
+      </div>
+      <label>Auto-Start on Restart</label>
+      <select id="editWsAutoStart">
+        <option value="true">Enabled</option>
+        <option value="false">Disabled</option>
+      </select>
+      <div class="row" style="justify-content:flex-end; margin-top:14px;">
+        <button class="secondary" onclick="closeEditWsModal()">Cancel</button>
+        <button onclick="saveEditWsModal()">Save Changes</button>
+      </div>
+    </div>
+  </div>
+
   <div class="toast" id="toast"></div>
 
   <script>
@@ -2477,6 +3210,8 @@ HTML_PAGE = """<!DOCTYPE html>
     let loadedThreads = [];
     let latestCreatedIds = [];
     let latestExtractedLinks = [];
+    let cachedWsSessions = [];
+    let _refreshInFlight = false;
 
     function showToast(msg, err = false) {
       const el = document.getElementById("toast");
@@ -2493,29 +3228,55 @@ HTML_PAGE = """<!DOCTYPE html>
       refreshState();
     }
 
-    async function api(path, method = "GET", body = null) {
+    async function api(path, method = "GET", body = null, timeoutMs = 15000) {
       const tok = localStorage.getItem(TOKEN_KEY) || "";
       const headers = { "Content-Type": "application/json" };
       if (tok) headers["X-Panel-Token"] = tok;
-      const res = await fetch(path, {
-        method,
-        headers,
-        body: body ? JSON.stringify(body) : null,
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok && res.status !== 202) {
-        throw new Error(data.detail || `Request failed (${res.status})`);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const res = await fetch(path, {
+          method,
+          headers,
+          body: body ? JSON.stringify(body) : null,
+          signal: controller.signal,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok && res.status !== 202) {
+          throw new Error(data.detail || `Request failed (${res.status})`);
+        }
+        return { status: res.status, data };
+      } catch (err) {
+        if (err && err.name === "AbortError") {
+          throw new Error("Request timed out");
+        }
+        throw err;
+      } finally {
+        clearTimeout(timer);
       }
-      return { status: res.status, data };
+    }
+
+    function parseSelectedLogin(rawVal) {
+      const v = String(rawVal || "").trim();
+      if (v.startsWith("ws:")) return { ws_uid: v.slice(3), username: null };
+      if (v.startsWith("ig:")) return { ws_uid: null, username: v.slice(3) };
+      return { ws_uid: null, username: v || null };
     }
 
     function syncAccountSelectors(val) {
       if (!val) return;
-      for (const id of ["taskAccount", "gcCreatorAccount", "inviteAccount", "addMemberAccount"]) {
-        const el = document.getElementById(id);
-        if (el && Array.from(el.options).some(o => o.value === val)) {
-          el.value = val;
+      const parsed = parseSelectedLogin(val);
+      if (parsed.username) {
+        for (const id of ["gcCreatorAccount", "inviteAccount", "addMemberAccount"]) {
+          const el = document.getElementById(id);
+          if (el && Array.from(el.options).some(o => o.value === parsed.username)) {
+            el.value = parsed.username;
+          }
         }
+      }
+      const mgcSel = document.getElementById("mgcLoginSelect");
+      if (mgcSel && Array.from(mgcSel.options).some(o => o.value === val)) {
+        mgcSel.value = val;
       }
     }
 
@@ -2568,7 +3329,7 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     function selectAllLoaded(selectAll) {
-      if (!loadedThreads.length) return showToast("Load chats/groups first", true);
+      if (!loadedThreads.length) return showToast("Fetch GCs/chats first", true);
       document.getElementById("threadIdsInput").value = selectAll
         ? loadedThreads.map(t => String(t.id).trim()).filter(s => /^\d+$/.test(s)).join(", ")
         : "";
@@ -2576,18 +3337,40 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     async function refreshState() {
+      if (_refreshInFlight) return;
+      _refreshInFlight = true;
       try {
-        const { data } = await api("/api/state");
-        const s = data.stats;
+        const { data } = await api("/api/state", "GET", null, 5000);
+        const s = data.stats || {};
         document.getElementById("statsBar").textContent =
-          `CPU ${s.cpu_percent}% · RAM ${s.ram_percent}% (${s.ram_used_gb}/${s.ram_total_gb} GB) · RSS ${s.rss_mb} MB · Sent ${data.global_messages_sent} · Uptime ${data.uptime}`;
+          `CPU ${s.cpu_percent ?? 0}% · RAM ${s.ram_percent ?? 0}% (${s.ram_used_gb ?? 0}/${s.ram_total_gb ?? 0} GB) · RSS ${s.rss_mb ?? 0} MB · Sent ${data.global_messages_sent ?? 0} · Uptime ${data.uptime ?? ""}`;
 
         document.getElementById("wsMetaBar").textContent =
-          `igrapiweb: ${data.igrapiweb_available ? "Available" : "Not Installed"} · Default Pool Size: ${data.ws_socket_pool} · Separate from GitHub sync`;
+          `igrapiweb: ${data.igrapiweb_available ? "Available" : "Not Installed"} · Default Pool Size: ${data.ws_socket_pool} · Saved to ${data.is_custom_template ? "custom" : "default"} DATA_DIR`;
 
         const accs = Object.keys(data.accounts || {});
-        for (const id of ["taskAccount", "gcCreatorAccount", "inviteAccount", "addMemberAccount"]) {
+        const wsList = data.ws_sessions || [];
+        cachedWsSessions = wsList;
+
+        const loginOptions = [];
+        for (const w of wsList) {
+          loginOptions.push({ val: `ws:${w.uid}`, text: `WS: ${w.session_name}` });
+        }
+        for (const u of accs) {
+          loginOptions.push({ val: `ig:${u}`, text: `@${u} (saved)` });
+        }
+
+        for (const id of ["taskAccount", "mgcLoginSelect"]) {
           const sel = document.getElementById(id);
+          if (document.activeElement === sel) continue;
+          const prev = sel.value;
+          sel.innerHTML = loginOptions.map(o => `<option value="${escapeHtml(o.val)}">${escapeHtml(o.text)}</option>`).join("");
+          if (loginOptions.some(o => o.val === prev)) sel.value = prev;
+        }
+
+        for (const id of ["gcCreatorAccount", "inviteAccount", "addMemberAccount"]) {
+          const sel = document.getElementById(id);
+          if (document.activeElement === sel) continue;
           const prev = sel.value;
           sel.innerHTML = accs.map(u => `<option value="${escapeHtml(u)}">@${escapeHtml(u)}</option>`).join("");
           if (accs.includes(prev)) sel.value = prev;
@@ -2606,6 +3389,26 @@ HTML_PAGE = """<!DOCTYPE html>
           }).join("");
         }
 
+        const mgcBox = document.getElementById("multiGcJobsList");
+        const mgcJobs = data.multi_gc_jobs || [];
+        if (!mgcJobs.length) {
+          mgcBox.innerHTML = `<div class="muted">No Multi-GC sender jobs yet.</div>`;
+        } else {
+          mgcBox.innerHTML = mgcJobs.map(j => `
+            <div class="list-item">
+              <div>
+                <div><strong>${escapeHtml(j.job_id)}</strong> · ${escapeHtml(j.label)} · <strong>${escapeHtml(j.target_name)}</strong>
+                  <span class="badge ${j.running ? "on" : "off"}">${j.running ? "RUNNING" : "STOPPED"}</span>
+                  <span class="badge speed-badge">${escapeHtml((j.speed_mode || "slow").toUpperCase())}</span>
+                  <span class="badge nc-badge">${j.use_nc ? "WITH NC" : "NO NC"}</span>
+                </div>
+                <div class="muted">GCs: ${(j.thread_ids || []).length} · Sent: ${j.msg_count} · NC: ${j.rename_count} · ${escapeHtml(j.last_event || "")} (${escapeHtml(j.last_update || "")})</div>
+              </div>
+              ${j.running ? `<button class="danger" onclick="stopMultiGc('${escapeHtml(j.job_id)}')">Stop</button>` : ""}
+            </div>
+          `).join("");
+        }
+
         const tBox = document.getElementById("tasksList");
         if (!data.tasks || !data.tasks.length) {
           tBox.innerHTML = `<div class="muted">No tasks created yet.</div>`;
@@ -2613,7 +3416,7 @@ HTML_PAGE = """<!DOCTYPE html>
           tBox.innerHTML = data.tasks.map(t => `
             <div class="list-item">
               <div>
-                <div><strong>${escapeHtml(t.task_id)}</strong> · @${escapeHtml(t.username)} → <strong>${escapeHtml(t.target_name)}</strong>
+                <div><strong>${escapeHtml(t.task_id)}</strong> · ${escapeHtml(t.username || "")} → <strong>${escapeHtml(t.target_name)}</strong>
                   <span class="badge ${t.running ? "on" : "off"}">${t.running ? "RUNNING" : "STOPPED"}</span>
                   <span class="badge speed-badge">${escapeHtml((t.speed_mode || "slow").toUpperCase())}</span>
                   <span class="badge nc-badge">${t.use_nc !== false ? "WITH NC" : "NO NC"}</span>
@@ -2655,45 +3458,44 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         const wsBox = document.getElementById("wsSessionsList");
-        const wsList = data.ws_sessions || [];
-        if (!wsList.length) {
-          wsBox.innerHTML = `<div class="muted">No WebSocket sessions added yet.</div>`;
-        } else {
-          wsBox.innerHTML = wsList.map(w => {
-            const st = w.stats || {};
-            const live = st.status === "live";
-            const sockInpId = `wsLiveSock_${w.uid}`;
-            const activeSockEl = document.getElementById(sockInpId);
-            const curSockVal = (activeSockEl && document.activeElement === activeSockEl)
-              ? activeSockEl.value
-              : (w.socket_pool || 1);
-            return `<div class="list-item">
-              <div>
-                <div><strong>${escapeHtml(w.session_name)}</strong> <span class="tid-mono">(${escapeHtml(w.uid)})</span> · Thread <span class="tid-mono">${escapeHtml(w.thread_id)}</span>
-                  <span class="badge ${live ? "on" : "off"}">${escapeHtml((st.status || "stopped").toUpperCase())}</span>
-                  <span class="badge speed-badge">🔌 ${st.sockets_live || 0}/${st.sockets_total || 0} (pool:${w.socket_pool || 1})</span>
-                  ${st.session_status ? `<span class="badge nc-badge">🩺 ${escapeHtml(st.session_status)}</span>` : ""}
+        const activeInsideWs = document.activeElement && wsBox.contains(document.activeElement);
+        if (!activeInsideWs) {
+          if (!wsList.length) {
+            wsBox.innerHTML = `<div class="muted">No WebSocket sessions added yet.</div>`;
+          } else {
+            wsBox.innerHTML = wsList.map(w => {
+              const st = w.stats || {};
+              const live = st.status === "live";
+              const sockInpId = `wsLiveSock_${w.uid}`;
+              return `<div class="list-item">
+                <div>
+                  <div><strong>${escapeHtml(w.session_name)}</strong> <span class="tid-mono">(${escapeHtml(w.uid)})</span> · Thread <span class="tid-mono">${escapeHtml(w.thread_id)}</span>
+                    <span class="badge ${live ? "on" : "off"}">${escapeHtml((st.status || "stopped").toUpperCase())}</span>
+                    <span class="badge speed-badge">🔌 ${st.sockets_live || 0}/${st.sockets_total || 0} (pool:${w.socket_pool || 1})</span>
+                    ${st.session_status ? `<span class="badge nc-badge">🩺 ${escapeHtml(st.session_status)}</span>` : ""}
+                  </div>
+                  <div class="muted">Sent: ${st.sent || 0} · Fail: ${st.failed || 0} · Renames: ${st.renames || 0} · Delay: ${w.delay_min}-${w.delay_max}s · Ren: ${w.rename_min}-${w.rename_max}s</div>
+                  ${st.last_error ? `<div class="tid-mono" style="color:#fca5a5; margin-top:2px;">Err: ${escapeHtml(st.last_error)}</div>` : ""}
+                  <div class="row" style="margin-top:6px;">
+                    <span class="muted">Live Sockets (1–10):</span>
+                    <input id="${escapeHtml(sockInpId)}" type="number" min="1" max="10" value="${w.socket_pool || 1}" style="width:74px; padding:5px 8px;" />
+                    <button class="secondary" onclick="wsSetSockets('${escapeHtml(w.uid)}')">Set Sockets</button>
+                  </div>
                 </div>
-                <div class="muted">Sent: ${st.sent || 0} · Fail: ${st.failed || 0} · Renames: ${st.renames || 0} · Delay: ${w.delay_min}-${w.delay_max}s · Ren: ${w.rename_min}-${w.rename_max}s</div>
-                ${st.last_error ? `<div class="tid-mono" style="color:#fca5a5; margin-top:2px;">Err: ${escapeHtml(st.last_error)}</div>` : ""}
-                <div class="row" style="margin-top:6px;">
-                  <span class="muted">Live Sockets (1–10):</span>
-                  <input id="${escapeHtml(sockInpId)}" type="number" min="1" max="10" value="${curSockVal}" style="width:74px; padding:5px 8px;" />
-                  <button class="secondary" onclick="wsSetSockets('${escapeHtml(w.uid)}')">Set Sockets</button>
+                <div class="row" style="margin:0;">
+                  ${live
+                    ? `<button class="danger" onclick="wsAction('${escapeHtml(w.uid)}', 'stop')">Stop</button>`
+                    : `<button onclick="wsAction('${escapeHtml(w.uid)}', 'start')">Start</button>`}
+                  <button class="secondary" onclick="openEditWsModal('${escapeHtml(w.uid)}')">Edit</button>
+                  <button class="secondary" onclick="wsAdjust('${escapeHtml(w.uid)}', -0.1, 0)">Msg -0.1</button>
+                  <button class="secondary" onclick="wsAdjust('${escapeHtml(w.uid)}', 0.1, 0)">Msg +0.1</button>
+                  <button class="secondary" onclick="wsAdjust('${escapeHtml(w.uid)}', 0, -1)">Ren -1</button>
+                  <button class="secondary" onclick="wsAdjust('${escapeHtml(w.uid)}', 0, 1)">Ren +1</button>
+                  <button class="secondary" onclick="wsDelete('${escapeHtml(w.uid)}')">Delete</button>
                 </div>
-              </div>
-              <div class="row" style="margin:0;">
-                ${live
-                  ? `<button class="danger" onclick="wsAction('${escapeHtml(w.uid)}', 'stop')">Stop</button>`
-                  : `<button onclick="wsAction('${escapeHtml(w.uid)}', 'start')">Start</button>`}
-                <button class="secondary" onclick="wsAdjust('${escapeHtml(w.uid)}', -0.1, 0)">Msg -0.1</button>
-                <button class="secondary" onclick="wsAdjust('${escapeHtml(w.uid)}', 0.1, 0)">Msg +0.1</button>
-                <button class="secondary" onclick="wsAdjust('${escapeHtml(w.uid)}', 0, -1)">Ren -1</button>
-                <button class="secondary" onclick="wsAdjust('${escapeHtml(w.uid)}', 0, 1)">Ren +1</button>
-                <button class="secondary" onclick="wsDelete('${escapeHtml(w.uid)}')">Delete</button>
-              </div>
-            </div>`;
-          }).join("");
+              </div>`;
+            }).join("");
+          }
         }
 
         const tplEl = document.getElementById("templateLineInput");
@@ -2705,8 +3507,120 @@ HTML_PAGE = """<!DOCTYPE html>
           gtEl.value = data.group_title_template || "{TARGET}";
         }
       } catch (e) {
-        document.getElementById("statsBar").textContent = e.message;
+        document.getElementById("statsBar").textContent = `Stats updating (${e.message || "retrying"})...`;
+      } finally {
+        _refreshInFlight = false;
       }
+    }
+
+    function openEditWsModal(uid) {
+      const w = cachedWsSessions.find(x => x.uid === uid);
+      if (!w) return showToast("Session not found", true);
+      document.getElementById("editWsUid").value = w.uid;
+      document.getElementById("editWsName").value = w.session_name || "";
+      document.getElementById("editWsSid").value = "";
+      document.getElementById("editWsGcName").value = w.gc_name_text || "";
+      document.getElementById("editWsMsgText").value = w.msg_text || "";
+      document.getElementById("editWsThreadId").value = w.thread_id || "";
+      document.getElementById("editWsThreadIds").value = (w.thread_ids || []).join(", ");
+      document.getElementById("editWsSockets").value = w.socket_pool || 1;
+      document.getElementById("editWsDelayMin").value = w.delay_min ?? 0.1;
+      document.getElementById("editWsDelayMax").value = w.delay_max ?? 0.2;
+      document.getElementById("editWsRenameMin").value = w.rename_min ?? 5.0;
+      document.getElementById("editWsRenameMax").value = w.rename_max ?? 15.0;
+      document.getElementById("editWsAutoStart").value = w.auto_start ? "true" : "false";
+      document.getElementById("wsEditModal").style.display = "flex";
+    }
+
+    function closeEditWsModal() {
+      document.getElementById("wsEditModal").style.display = "none";
+    }
+
+    async function saveEditWsModal() {
+      try {
+        const uid = document.getElementById("editWsUid").value;
+        const payload = {
+          session_name: document.getElementById("editWsName").value.trim(),
+          session_id: document.getElementById("editWsSid").value.trim() || null,
+          gc_name_text: document.getElementById("editWsGcName").value.trim(),
+          msg_text: document.getElementById("editWsMsgText").value.trim(),
+          thread_id: document.getElementById("editWsThreadId").value.trim(),
+          thread_ids: parseThreadStringList(document.getElementById("editWsThreadIds").value),
+          socket_pool: parseInt(document.getElementById("editWsSockets").value, 10) || 1,
+          delay_min: parseFloat(document.getElementById("editWsDelayMin").value) || 0.1,
+          delay_max: parseFloat(document.getElementById("editWsDelayMax").value) || 0.2,
+          rename_min: parseFloat(document.getElementById("editWsRenameMin").value) || 5.0,
+          rename_max: parseFloat(document.getElementById("editWsRenameMax").value) || 15.0,
+          auto_start: document.getElementById("editWsAutoStart").value === "true",
+        };
+        await api(`/api/ws/sessions/${encodeURIComponent(uid)}`, "PATCH", payload);
+        closeEditWsModal();
+        showToast("WS session updated & saved");
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function fetchThreads(onlyGroups = true) {
+      const rawSel = document.getElementById("taskAccount").value;
+      const parsed = parseSelectedLogin(rawSel);
+      document.getElementById("threadStatus").textContent = "Loading...";
+      try {
+        const params = new URLSearchParams();
+        if (parsed.ws_uid) params.set("ws_uid", parsed.ws_uid);
+        if (parsed.username) params.set("username", parsed.username);
+        const { data } = await api(`/api/threads?${params.toString()}`, "GET", null, 20000);
+        const allItems = Array.isArray(data.threads) ? data.threads : [];
+        loadedThreads = onlyGroups ? allItems.filter(t => Boolean(t.is_group)) : allItems;
+        if (!loadedThreads.length && onlyGroups && allItems.length) {
+          loadedThreads = allItems;
+        }
+        renderThreadPicker();
+        document.getElementById("threadStatus").textContent = `${loadedThreads.length} ${onlyGroups ? "GCs" : "chats"} loaded`;
+      } catch (e) {
+        document.getElementById("threadStatus").textContent = "";
+        showToast(e.message, true);
+      }
+    }
+
+    function fillMultiGcFromSelected() {
+      const tids = getSelectedThreadStrings();
+      if (!tids.length) return showToast("Select or enter GC thread IDs first", true);
+      document.getElementById("mgcThreadIdsInput").value = tids.join(", ");
+      showToast(`Copied ${tids.length} GC ID(s)`);
+    }
+
+    async function startMultiGc() {
+      try {
+        const parsed = parseSelectedLogin(document.getElementById("mgcLoginSelect").value);
+        const customRaw = document.getElementById("mgcThreadIdsInput").value.trim();
+        const thread_ids = customRaw ? parseThreadStringList(customRaw) : getSelectedThreadStrings();
+        const target_name = document.getElementById("mgcTargetInput").value.trim() || document.getElementById("targetInput").value.trim();
+        const custom_text = document.getElementById("mgcCustomText").value.trim();
+        const nc_text = document.getElementById("mgcNcText").value.trim();
+        const speed_mode = document.getElementById("mgcSpeedMode").value;
+        const use_nc = document.getElementById("mgcNcMode").value === "true";
+
+        const { data } = await api("/api/multi-gc/start", "POST", {
+          username: parsed.username,
+          ws_uid: parsed.ws_uid,
+          thread_ids,
+          target_name,
+          custom_text,
+          nc_text,
+          speed_mode,
+          use_nc,
+        });
+        showToast(`Started Multi-GC ${data.job_id} (${data.speed_mode}, ${data.use_nc ? "with NC" : "without NC"})`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function stopMultiGc(jobId) {
+      try {
+        await api(`/api/multi-gc/${encodeURIComponent(jobId)}/stop`, "POST");
+        showToast(`Stopped Multi-GC ${jobId}`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
     }
 
     async function addUserToSelectedGroups() {
@@ -2730,7 +3644,7 @@ HTML_PAGE = """<!DOCTYPE html>
           thread_ids,
           member_input,
           cooldown_sec,
-        });
+        }, 120000);
 
         const rows = Array.isArray(data.results) ? data.results : [];
         outBox.innerHTML = rows.map(r => {
@@ -2849,29 +3763,21 @@ HTML_PAGE = """<!DOCTYPE html>
       } catch (e) { showToast(e.message, true); }
     }
 
-    async function fetchThreads() {
-      const u = document.getElementById("taskAccount").value;
-      if (!u) return showToast("Select an account first", true);
-      document.getElementById("threadStatus").textContent = "Loading...";
-      try {
-        const { data } = await api(`/api/threads/${encodeURIComponent(u)}`);
-        loadedThreads = Array.isArray(data.threads) ? data.threads : [];
-        renderThreadPicker();
-        document.getElementById("threadStatus").textContent = `${loadedThreads.length} loaded`;
-      } catch (e) {
-        document.getElementById("threadStatus").textContent = "";
-        showToast(e.message, true);
-      }
-    }
-
     async function startTask() {
       try {
-        const username = document.getElementById("taskAccount").value;
+        const parsed = parseSelectedLogin(document.getElementById("taskAccount").value);
         const target_name = document.getElementById("targetInput").value.trim();
         const speed_mode = document.getElementById("speedMode").value;
         const use_nc = document.getElementById("ncMode").value === "true";
         const thread_ids = getSelectedThreadStrings();
-        const { data } = await api("/api/tasks/start", "POST", { username, thread_ids, target_name, speed_mode, use_nc });
+        const { data } = await api("/api/tasks/start", "POST", {
+          username: parsed.username,
+          ws_uid: parsed.ws_uid,
+          thread_ids,
+          target_name,
+          speed_mode,
+          use_nc,
+        });
         showToast(`Started task ${data.task_id} (${data.speed_mode}, ${data.use_nc ? "with NC" : "no NC"})`);
         refreshState();
       } catch (e) { showToast(e.message, true); }
@@ -2924,7 +3830,7 @@ HTML_PAGE = """<!DOCTYPE html>
         const resBox = document.getElementById("inviteLinksResult");
         resBox.innerHTML = `<div class="muted">Extracting links for ${thread_ids.length} thread(s)...</div>`;
 
-        const { data } = await api("/api/groups/invite-links", "POST", { username, thread_ids });
+        const { data } = await api("/api/groups/invite-links", "POST", { username, thread_ids }, 60000);
         latestExtractedLinks = Array.isArray(data.results) ? data.results : [];
 
         resBox.innerHTML = latestExtractedLinks.map(r => {
@@ -2967,7 +3873,7 @@ HTML_PAGE = """<!DOCTYPE html>
     async function stopAll() {
       try {
         await api("/api/tasks/stop-all", "POST");
-        showToast("Stopped all tasks, creators & WS sessions");
+        showToast("Stopped all tasks, Multi-GC jobs, creators & WS sessions");
         refreshState();
       } catch (e) { showToast(e.message, true); }
     }
@@ -3007,19 +3913,118 @@ def index(request: Request):
 
 
 @app.on_event("startup")
-def _startup_restore_ws():
+def _startup_restore_state():
+    # 1. Restore WS sessions
     saved_ws = load_ws_sessions_disk()
     with ws_lock:
         for uid, rec in saved_ws.items():
             if isinstance(rec, dict) and rec.get("session_id") and rec.get("thread_id"):
                 rec["_uid"] = uid
                 ws_sessions[uid] = WsSessionWorker(rec)
-        to_start = [(uid, w) for uid, w in ws_sessions.items() if w.data.get("auto_start", False)]
-    for uid, w in to_start:
+        ws_to_start = [(uid, w) for uid, w in ws_sessions.items() if w.data.get("auto_start", False)]
+
+    for uid, w in ws_to_start:
         try:
             w.start()
         except Exception as exc:
             print(f"[WS] Auto-start failed for {uid}: {exc}", flush=True)
+
+    # 2. Restore worker_loop & multi_gc_loop tasks
+    saved_tasks = load_tasks_state_disk()
+    tasks_to_run = []
+    mgc_to_run = []
+
+    with tasks_lock:
+        for item in saved_tasks.get("tasks", []):
+            tid = str(item.get("task_id") or "").strip()
+            tids = parse_thread_ids(item.get("thread_ids") or [])
+            target = str(item.get("target_name") or "").strip()
+            if not tid or not tids or not target:
+                continue
+            was_running = bool(item.get("running", False))
+            active_tasks[tid] = {
+                "client": None,
+                "username": item.get("username"),
+                "raw_username": item.get("raw_username"),
+                "ws_uid": item.get("ws_uid"),
+                "session_id": item.get("session_id"),
+                "ua": item.get("ua"),
+                "thread_ids": tids,
+                "target_name": target,
+                "speed_mode": item.get("speed_mode", "slow"),
+                "use_nc": bool(item.get("use_nc", True)),
+                "running": was_running,
+                "msg_count": int(item.get("msg_count", 0)),
+                "last_event": "Restored after restart" if was_running else "Stopped (restored)",
+                "last_update": datetime.now().strftime("%H:%M:%S"),
+            }
+            if was_running:
+                tasks_to_run.append(tid)
+
+        for item in saved_tasks.get("multi_gc", []):
+            jid = str(item.get("job_id") or "").strip()
+            tids = parse_thread_ids(item.get("thread_ids") or [])
+            if not jid or not tids:
+                continue
+            was_running = bool(item.get("running", False))
+            multi_gc_jobs[jid] = {
+                "job_id": jid,
+                "client": None,
+                "username": item.get("username"),
+                "ws_uid": item.get("ws_uid"),
+                "session_id": item.get("session_id"),
+                "ua": item.get("ua"),
+                "label": item.get("label", ""),
+                "thread_ids": tids,
+                "target_name": item.get("target_name", ""),
+                "custom_text": item.get("custom_text", ""),
+                "nc_text": item.get("nc_text", ""),
+                "speed_mode": item.get("speed_mode", "slow"),
+                "use_nc": bool(item.get("use_nc", True)),
+                "running": was_running,
+                "msg_count": int(item.get("msg_count", 0)),
+                "rename_count": int(item.get("rename_count", 0)),
+                "last_event": "Restored after restart" if was_running else "Stopped (restored)",
+                "last_update": datetime.now().strftime("%H:%M:%S"),
+            }
+            if was_running:
+                mgc_to_run.append(jid)
+
+    for tid in tasks_to_run:
+        try:
+            with tasks_lock:
+                info = active_tasks.get(tid)
+            if info and info.get("client") is None:
+                cl, sid, ua, _ = _resolve_sender_auth(info.get("raw_username"), info.get("ws_uid"), info.get("session_id"))
+                with tasks_lock:
+                    if tid in active_tasks:
+                        active_tasks[tid]["client"] = cl
+                        if sid:
+                            active_tasks[tid]["session_id"] = sid
+                        if ua:
+                            active_tasks[tid]["ua"] = ua
+            threading.Thread(target=worker_loop, args=(tid,), daemon=True).start()
+        except Exception as exc:
+            set_task_running(tid, False)
+            log_task(tid, f"Auto-resume failed: {str(exc)[:60]}")
+
+    for jid in mgc_to_run:
+        try:
+            with tasks_lock:
+                job = multi_gc_jobs.get(jid)
+            if job and job.get("client") is None:
+                cl, sid, ua, _ = _resolve_sender_auth(job.get("username"), job.get("ws_uid"), job.get("session_id"))
+                with tasks_lock:
+                    if jid in multi_gc_jobs:
+                        multi_gc_jobs[jid]["client"] = cl
+                        if sid:
+                            multi_gc_jobs[jid]["session_id"] = sid
+                        if ua:
+                            multi_gc_jobs[jid]["ua"] = ua
+            threading.Thread(target=multi_gc_loop, args=(jid,), daemon=True).start()
+        except Exception as exc:
+            set_multi_gc_running(jid, False)
+            log_multi_gc(jid, f"Auto-resume failed: {str(exc)[:60]}")
 
 
 if __name__ == "__main__":
